@@ -27,7 +27,13 @@ except ModuleNotFoundError:
 
 try:
     import transformer_engine
+
+    # Incomplete uninstall can leave an empty namespace without __version__;
+    # cudnn_attention assumes a real TE install — treat as unavailable.
+    if not hasattr(transformer_engine, "__version__"):
+        raise ModuleNotFoundError("transformer_engine stub (no __version__)")
     from groot.vla.model.dreamzero.modules.cudnn_attention import DotProductAttention
+
     TRANSFORMER_ENGINE_AVAILABLE = True
 except ModuleNotFoundError:
     TRANSFORMER_ENGINE_AVAILABLE = False
