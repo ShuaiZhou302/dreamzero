@@ -160,6 +160,11 @@ class EmbodimentTag(Enum):
     The datasets with DREAM actions.
     """
 
+    AGX_ALOHA = "agx_aloha"
+    """
+    The AgileX ALOHA embodiment.
+    """
+
     UNKNOWN = "unknown"
 
     GR1_UNIFIED_SEGMENTATION = "gr1_unified_segmentation"

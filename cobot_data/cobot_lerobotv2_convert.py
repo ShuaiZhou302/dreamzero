@@ -359,10 +359,12 @@ def main() -> None:
     print(
         "python scripts/data/convert_lerobot_to_gear.py "
         f"--dataset-path \"{output_dir}\" "
-        "--embodiment-tag xdof "
-        f"--state-keys '{{\"joint_pos\":[0,{state_dim-1}],\"gripper_pos\":[{state_dim-1},{state_dim}]}}' "
-        f"--action-keys '{{\"joint_pos\":[0,{action_dim-1}],\"gripper_pos\":[{action_dim-1},{action_dim}]}}' "
-        "--relative-action-keys joint_pos gripper_pos "
+        "--embodiment-tag agx_aloha "
+        "--state-keys '{\"left_joint_pos\":[0,6],\"left_gripper_pos\":[6,7],"
+        "\"right_joint_pos\":[7,13],\"right_gripper_pos\":[13,14]}' "
+        "--action-keys '{\"left_joint_pos\":[0,6],\"left_gripper_pos\":[6,7],"
+        "\"right_joint_pos\":[7,13],\"right_gripper_pos\":[13,14]}' "
+        "--relative-action-keys left_joint_pos left_gripper_pos right_joint_pos right_gripper_pos "
         "--task-key annotation.task"
     )
 

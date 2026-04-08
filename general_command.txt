@@ -1,0 +1,40 @@
+srun -p acd_u -c 8 --gres=gpu:3 --mem=256G --job-name=shuai_dz --pty bash
+
+cd /data/user/wsong890/shuaizhou/dreamzero
+conda activate dz_shuai
+
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH
+
+export HF_HOME=/data/user/wsong890/shuaizhou/dreamzero/checkpoints/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+python - <<'PY'
+import pathlib, re
+p = pathlib.Path("/data/user/wsong890/shuaizhou/dreamzero/checkpoints/DreamZero-DROID/experiment_cfg/conf.yaml")
+s = p.read_text()
+s = re.sub(
+    r"tokenizer_path:\s*.*",
+    "tokenizer_path: /data/user/wsong890/shuaizhou/dreamzero/checkpoints/wan_model/google/umt5-xxl",
+    s,
+)
+p.write_text(s)
+PY
+
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  socket_test_optimized_AR.py \
+  --model-path /data/user/wsong890/shuaizhou/dreamzero/checkpoints/DreamZero-DROID \
+  --port 8766 \
+  --enable-dit-cache
+
+
+
+cd /data/user/wsong890/shuaizhou/dreamzero
+conda activate dz_shuai
+
+CUDA_VISIBLE_DEVICES=2 python test_client_AR.py --host localhost --port 8766
+
+
+save log.txt for debug in terminal  
+tmux capture-pane -p -S -50000 > ~/dreamzero_infer_log.txt
