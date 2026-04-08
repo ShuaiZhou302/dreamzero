@@ -87,6 +87,7 @@ def build_episode_dataframe(
     action: np.ndarray,
     episode_idx: int,
     fps: float,
+    task_text: str,
 ) -> pd.DataFrame:
     if len(qpos) != len(action):
         raise ValueError(
@@ -106,8 +107,8 @@ def build_episode_dataframe(
             "episode_index": np.full((t,), episode_idx, dtype=np.int64),
             "index": np.arange(t, dtype=np.int64),
             "task_index": np.zeros((t,), dtype=np.int64),
-            # Keep an empty language field so downstream task extraction works.
-            "annotation.task": [""] * t,
+            # Usually one instruction text for the whole episode.
+            "annotation.task": [task_text] * t,
         }
     )
     return df
@@ -118,6 +119,7 @@ def convert_episode(
     out_root: Path,
     out_episode_idx: int,
     fps: float,
+    task_text: str,
 ) -> Tuple[int, int, int]:
     chunk_idx = out_episode_idx // CHUNK_SIZE
     chunk_name = f"chunk-{chunk_idx:03d}"
@@ -140,7 +142,7 @@ def convert_episode(
         state_dim = int(qpos.shape[1])
         action_dim = int(action.shape[1])
 
-        df = build_episode_dataframe(qpos, action, out_episode_idx, fps)
+        df = build_episode_dataframe(qpos, action, out_episode_idx, fps, task_text)
         df.to_parquet(data_chunk_dir / parquet_name, index=False)
 
         for cam in CAMERA_KEYS:
@@ -255,6 +257,13 @@ def maybe_clear_old_outputs(output_dir: Path, force: bool) -> None:
                 child.unlink()
 
 
+def infer_task_text(input_dir: Path, explicit_task_text: str | None) -> str:
+    if explicit_task_text is not None and explicit_task_text.strip():
+        return explicit_task_text.strip()
+    # Default task text: dataset folder name, converting underscores to spaces.
+    return input_dir.name.replace("_", " ").strip() or "task"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert ALOHA HDF5 episodes to minimal LeRobot v2 dataset format."
@@ -284,6 +293,12 @@ def main() -> None:
         help="Optional cap for quick testing",
     )
     parser.add_argument(
+        "--task-text",
+        type=str,
+        default=None,
+        help="Optional override for annotation.task. Default: input-dir basename with '_' replaced by spaces",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Clear existing generated outputs under data/videos/meta first",
@@ -292,6 +307,7 @@ def main() -> None:
 
     input_dir = args.input_dir.resolve()
     output_dir = args.output_dir.resolve()
+    task_text = infer_task_text(input_dir, args.task_text)
     ensure_output_layout(output_dir)
     maybe_clear_old_outputs(output_dir, force=args.force)
 
@@ -308,7 +324,9 @@ def main() -> None:
 
     for out_ep_idx, h5_path in enumerate(h5_paths):
         print(f"[{out_ep_idx + 1}/{len(h5_paths)}] converting {h5_path.name}")
-        t, sdim, adim = convert_episode(h5_path, output_dir, out_ep_idx, args.fps)
+        t, sdim, adim = convert_episode(
+            h5_path, output_dir, out_ep_idx, args.fps, task_text
+        )
         total_frames += t
         if state_dim is None:
             state_dim = sdim
@@ -335,6 +353,7 @@ def main() -> None:
     print(f"- input_dir : {input_dir}")
     print(f"- output_dir: {output_dir}")
     print(f"- episodes  : {len(h5_paths)}")
+    print(f"- task_text : {task_text}")
     print(f"- info.json : {info_path}")
     print("\nNext:")
     print(
