@@ -44,7 +44,7 @@ echo "[2/2] Convert LeRobot v2 metadata -> DreamZero GEAR metadata"
 
 python "/data/user/wsong890/shuaizhou/dreamzero/scripts/data/convert_lerobot_to_gear.py" \
   --dataset-path "${OUTPUT_DIR}" \
-  --embodiment-tag xdof \
+  --embodiment-tag agx_aloha \
   --state-keys '{"joint_pos":[0,13],"gripper_pos":[13,14]}' \
   --action-keys '{"joint_pos":[0,13],"gripper_pos":[13,14]}' \
   --relative-action-keys joint_pos gripper_pos \
