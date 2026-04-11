@@ -19,6 +19,10 @@
 
 export HYDRA_FULL_ERROR=1
 
+# Weights & Biases: 默认离线（无需 wandb login / API key），日志在 $OUTPUT_DIR/wandb/offline-run-*
+# 需要云端面板时：export WANDB_MODE=online 并先执行 wandb login；离线 run 之后可用 wandb sync 上传
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
 # ============ CHANGE THESE VARIABLES ============
 # Dataset path (LeRobot v2 + GEAR meta: state 14, action 14, 3 views cam_high / cam_left_wrist / cam_right_wrist)
 AGX_ALOHA_DATA_ROOT=${AGX_ALOHA_DATA_ROOT:-"./data/agx_aloha_lerobot"}
@@ -31,6 +35,9 @@ if [ -z "${NUM_GPUS}" ]; then
   NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 fi
 NUM_GPUS=${NUM_GPUS:-8}
+
+# 终端完整日志（stdout+stderr）：不设则不写文件。设为 1 则写入 $OUTPUT_DIR/console.log；设为路径则写入该文件
+TRAIN_CONSOLE_LOG=${TRAIN_CONSOLE_LOG:-}
 
 # Model weight paths (download from HuggingFace if not already present)
 WAN_CKPT_DIR=${WAN_CKPT_DIR:-"./checkpoints/Wan2.1-I2V-14B-480P"}
@@ -56,7 +63,19 @@ if [ ! -d "$AGX_ALOHA_DATA_ROOT" ]; then
     exit 1
 fi
 
-torchrun --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experiment.py \
+# 用当前环境的 python 启动，避免 conda 里 torchrun 的 shebang 仍指向已删除的旧 env（如 dreamzero）
+TRAIN_LOG_PATH=""
+if [ -n "$TRAIN_CONSOLE_LOG" ]; then
+    case "$TRAIN_CONSOLE_LOG" in
+        1|true|TRUE|yes|YES) TRAIN_LOG_PATH="$OUTPUT_DIR/console.log" ;;
+        *) TRAIN_LOG_PATH="$TRAIN_CONSOLE_LOG" ;;
+    esac
+    mkdir -p "$(dirname "$TRAIN_LOG_PATH")"
+    echo "Logging console output to: $TRAIN_LOG_PATH"
+fi
+
+_run_train() {
+python -m torch.distributed.run --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experiment.py \
     report_to=wandb \
     data=dreamzero/agx_aloha_relative \
     wandb_project=dreamzero \
@@ -76,7 +95,8 @@ torchrun --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experiment
     save_steps=10000 \
     training_args.warmup_ratio=0.05 \
     output_dir=$OUTPUT_DIR \
-    per_device_train_batch_size=4 \
+    per_device_train_batch_size=1 \
+    gradient_accumulation_steps=4 \
     max_steps=100000 \
     weight_decay=1e-5 \
     save_total_limit=10 \
@@ -101,3 +121,12 @@ torchrun --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experiment
     pretrained_model_path=./checkpoints/DreamZero-AgiBot \
     ++action_head_cfg.config.skip_component_loading=true \
     ++action_head_cfg.config.defer_lora_injection=true
+}
+
+if [ -n "$TRAIN_LOG_PATH" ]; then
+    set -o pipefail
+    _run_train 2>&1 | tee -a "$TRAIN_LOG_PATH"
+    exit "${PIPESTATUS[0]}"
+else
+    _run_train
+fi

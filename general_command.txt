@@ -1,3 +1,6 @@
+
+# infer example
+
 srun -p acd_u -c 8 --gres=gpu:3 --mem=256G --job-name=shuai_dz --pty bash
 
 cd /data/user/wsong890/shuaizhou/dreamzero
@@ -16,7 +19,7 @@ p = pathlib.Path("/data/user/wsong890/shuaizhou/dreamzero/checkpoints/DreamZero-
 s = p.read_text()
 s = re.sub(
     r"tokenizer_path:\s*.*",
-    "tokenizer_path: /data/user/wsong890/shuaizhou/dreamzero/checkpoints/wan_model/google/umt5-xxl",
+    "tokenizer_path: /data/user/wsong890/shuaizhou/dreamzero/checkpoints/umt5-xxl",
     s,
 )
 p.write_text(s)
@@ -38,3 +41,15 @@ CUDA_VISIBLE_DEVICES=2 python test_client_AR.py --host localhost --port 8766
 
 save log.txt for debug in terminal  
 tmux capture-pane -p -S -50000 > ~/dreamzero_infer_log.txt
+
+
+# posttraining
+
+srun -p acd_u -c 8 --gres=gpu:8 --mem=1024G --job-name=shuai_dz_posttraining --pty bash
+
+cd /data/user/wsong890/shuaizhou/dreamzero
+conda activate dz_shuai
+
+# 不写环境变量 = 用脚本里默认的 AGX_ALOHA_DATA_ROOT / OUTPUT_DIR / NUM_GPUS（见 agx_aloha_training.sh）
+# 实际跑 cobot 数据 + 自定义输出目录 + 8 卡，用下面这一条（和「只 bash 脚本」是同一条入口，只是覆盖了变量）：
+TRAIN_CONSOLE_LOG=1 AGX_ALOHA_DATA_ROOT=/data/user/wsong890/shuaizhou/dreamzero/cobot_data/cobot_dataset OUTPUT_DIR=./checkpoints/agx_aloha_h100_run1 NUM_GPUS=8 bash scripts/train/agx_aloha_training.sh
