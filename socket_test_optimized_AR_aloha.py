@@ -85,44 +85,51 @@ class AlohaPolicy:
             os.makedirs(self._output_dir, exist_ok=True)
     
     def _convert_observation(self, obs: dict) -> dict:
-        """Convert roboarena observation format to AR_droid format.
-        
-        Roboarena format:
-            - observation/exterior_image_0_left: (H, W, 3) single frame
-            - observation/exterior_image_1_left: (H, W, 3) single frame
-            - observation/wrist_image_left: (H, W, 3) single frame
-            - observation/joint_position: (7,)
-            - observation/gripper_position: (1,)
-            - prompt: str
-        
-        AR_droid format:
-            - video.exterior_image_1_left: (T, H, W, 3) multi-frame
-            - video.exterior_image_2_left: (T, H, W, 3) multi-frame
-            - video.wrist_image_left: (T, H, W, 3) multi-frame
-            - state.joint_position: (1, 7)
-            - state.gripper_position: (1, 1)
-            - annotation.language.action_text: str
+        """WebSocket client obs -> dict for GrootSimPolicy (agx_aloha).
+
+        Images (uint8 RGB; client should resize to training H=176, W=320 before send):
+            - observation/cam_high, observation/cam_left_wrist, observation/cam_right_wrist:
+              each (H, W, 3) or (T, H, W, 3).
+            - Optional Roboarena slot names (mapped in image_key_mapping):
+              observation/exterior_image_0_left, _1_left, observation/wrist_image_left.
+
+        State (match cobot_dataset/meta/modality.json packed observation.state):
+            - Preferred: observation/proprio shape (14,) float, order
+              [0:6) left arm, [6:7) left grip, [7:13) right arm, [13:14) right grip.
+            - Or separate keys (each 1D length d, or (1,d)):
+              observation/left_joint_pos (6), left_gripper_pos (1),
+              right_joint_pos (6), right_gripper_pos (1).
+
+        Language:
+            - prompt: str -> converted to annotation.task.
+
+        Model-side keys produced in this method (video/state) must match experiment_cfg
+        for embodiment agx_aloha (video.cam_*, state.left_* / right_*, annotation.task).
         """
         converted = {}
         
-        # Map image keys (roboarena uses 0-indexed, AR_droid uses 1-indexed)
+        # Client obs keys -> model keys video.cam_* (Step 3 / deploy.md). Same physical order as training.
         image_key_mapping = {
             "observation/cam_high": "video.cam_high",
             "observation/cam_left_wrist": "video.cam_left_wrist",
             "observation/cam_right_wrist": "video.cam_right_wrist",
+            # RoboArena-style slots (PolicyServerConfig: 2 exterior + wrist):
+            "observation/exterior_image_0_left": "video.cam_high",
+            "observation/exterior_image_1_left": "video.cam_left_wrist",
+            "observation/wrist_image_left": "video.cam_right_wrist",
         }
         
         # Accumulate frames for each camera view
-        for roboarena_key, droid_key in image_key_mapping.items():
+        for roboarena_key, model_key in image_key_mapping.items():
             if roboarena_key in obs:
                 data = obs[roboarena_key]
                 if isinstance(data, np.ndarray):
                     if data.ndim == 4:
                         # Multiple frames (T, H, W, 3)
-                        self._frame_buffers[droid_key].extend(list(data))
+                        self._frame_buffers[model_key].extend(list(data))
                     else:
                         # Single frame (H, W, 3)
-                        self._frame_buffers[droid_key].append(data)
+                        self._frame_buffers[model_key].append(data)
 
         # Determine how many frames to use
         if self._is_first_call:
@@ -133,7 +140,7 @@ class AlohaPolicy:
             num_frames = self.FRAMES_PER_CHUNK
         
         # Build video tensors from accumulated frames
-        for droid_key, buffer in self._frame_buffers.items():
+        for model_key, buffer in self._frame_buffers.items():
             if len(buffer) > 0:
                 if len(buffer) >= num_frames:
                     # Take the last num_frames frames
@@ -146,32 +153,75 @@ class AlohaPolicy:
                         frames_to_use.insert(0, buffer[0])
                 # Stack to (T, H, W, C)
                 video = np.stack(frames_to_use, axis=0)
-                converted[droid_key] = video
+                converted[model_key] = video
+
+        # previous
+        # if "observation/joint_position" in obs:
+        #     joint_pos = obs["observation/joint_position"]
+        #     # Reshape to (1, 7) if needed
+        #     if joint_pos.ndim == 1:
+        #         joint_pos = joint_pos.reshape(1, -1)
+        #     converted["state.joint_position"] = joint_pos.astype(np.float64)
+        # else:
+        #     converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
         
-        # Convert state observations
-        if "observation/joint_position" in obs:
-            joint_pos = obs["observation/joint_position"]
-            # Reshape to (1, 7) if needed
-            if joint_pos.ndim == 1:
-                joint_pos = joint_pos.reshape(1, -1)
-            converted["state.joint_position"] = joint_pos.astype(np.float64)
-        else:
-            converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
+        # if "observation/gripper_position" in obs:
+        #     gripper_pos = obs["observation/gripper_position"]
+        #     # Reshape to (1, 1) if needed
+        #     if gripper_pos.ndim == 1:
+        #         gripper_pos = gripper_pos.reshape(1, -1)
+        #     converted["state.gripper_position"] = gripper_pos.astype(np.float64)
+        # else:
+        #     converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
         
-        if "observation/gripper_position" in obs:
-            gripper_pos = obs["observation/gripper_position"]
-            # Reshape to (1, 1) if needed
-            if gripper_pos.ndim == 1:
-                gripper_pos = gripper_pos.reshape(1, -1)
-            converted["state.gripper_position"] = gripper_pos.astype(np.float64)
+        # Convert state observations (agx_aloha: meta/modality.json packed indices on 14-dim vector)
+        def _to_state_row(v) -> np.ndarray:
+            a = np.asarray(v, dtype=np.float64).reshape(-1)
+            return a.reshape(1, -1)
+
+        if "observation/proprio" in obs:
+            p = np.asarray(obs["observation/proprio"], dtype=np.float64).reshape(-1)
+            if p.size < 14:
+                logger.warning(
+                    "observation/proprio length %s < 14; padding zeros", p.size
+                )
+                p = np.pad(p, (0, max(0, 14 - int(p.size))))
+            p = p[:14]
+            converted["state.left_joint_pos"] = p[0:6].reshape(1, 6)
+            converted["state.left_gripper_pos"] = p[6:7].reshape(1, 1)
+            converted["state.right_joint_pos"] = p[7:13].reshape(1, 6)
+            converted["state.right_gripper_pos"] = p[13:14].reshape(1, 1)
         else:
-            converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
-        
-        # Convert prompt
-        if "prompt" in obs:
-            converted["annotation.language.action_text"] = obs["prompt"]
-        else:
-            converted["annotation.language.action_text"] = ""
+            # Optional: separate client keys (shapes must match training)
+            def _get_or_zero(key: str, shape: tuple[int, ...]) -> np.ndarray:
+                if key not in obs:
+                    return np.zeros(shape, dtype=np.float64)
+                r = _to_state_row(obs[key])
+                if r.shape != shape:
+                    logger.warning("state key %s: got shape %s, expected %s", key, r.shape, shape)
+                    out = np.zeros(shape, dtype=np.float64)
+                    flat = r.reshape(-1)
+                    n = min(flat.size, int(np.prod(shape)))
+                    if n > 0:
+                        out.reshape(-1)[:n] = flat[:n]
+                    return out
+                return r
+
+            converted["state.left_joint_pos"] = _get_or_zero(
+                "observation/left_joint_pos", (1, 6)
+            )
+            converted["state.left_gripper_pos"] = _get_or_zero(
+                "observation/left_gripper_pos", (1, 1)
+            )
+            converted["state.right_joint_pos"] = _get_or_zero(
+                "observation/right_joint_pos", (1, 6)
+            )
+            converted["state.right_gripper_pos"] = _get_or_zero(
+                "observation/right_gripper_pos", (1, 1)
+            )
+
+        # Language (training key: annotation.task)
+        converted["annotation.task"] = str(obs.get("prompt", ""))
         
         return converted
     
@@ -404,7 +454,8 @@ class WebsocketPolicyServer:
         except Exception:
             return
 
-        for key in ("video.exterior_image_1_left", "video.exterior_image_2_left", "video.wrist_image_left"):
+        # Step 9 / deploy.md: enumerate model-side keys (same as `converted` after AlohaPolicy._convert_observation).
+        for key in ("video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"):
             if key not in obs:
                 continue
             value = obs[key]
@@ -798,8 +849,8 @@ def main(args: Args) -> None:
     # Configure server for aloha (1 cameras, 2 wrist camera, joint position actions)
     server_config = PolicyServerConfig(
         image_resolution=(176, 320),  # 
-        needs_wrist_camera=True,
-        n_external_cameras=2,
+        needs_wrist_camera=True, # so we have the right wrist camera
+        n_external_cameras=2, # we only have 1 external camera what is high camera
         needs_stereo_camera=False,
         needs_session_id=True,  # Track session to reset state for new clients
         action_space="joint_position",
@@ -833,4 +884,5 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
     args = tyro.cli(Args)
+    # remember here we need to uses the new checkpoint
     main(args)
