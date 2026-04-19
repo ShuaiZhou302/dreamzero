@@ -243,4 +243,12 @@ groot/control/envs/yam/data/eval/*
 /data
 
 checkpoints/
+checkpoints/agx_aloha_h100_run1/
+cobot_data/30min_data/
+cobot_data/cobot_dataset/
+te_wheels
+fa_sdist
+dreamzero_wheels
+.codex
+rerun_sdk-0.21.0-cp38-abi3-manylinux_2_31_x86_64.whl
 video_pred_output*/
