@@ -5,6 +5,12 @@ Convert ALOHA-style HDF5 episodes to a minimal LeRobot v2 dataset layout.
 Input (example):
   /path/to/cooking2/episode_0.hdf5
   /path/to/cooking2/episode_1.hdf5
+  Or nested tasks, e.g. new_data/stack_somethings/episode_0.hdf5 (auto-discovered).
+
+Per-episode language: if the HDF5 root has attribute ``task_description`` (or a few
+other common keys), that string is written to ``annotation.task`` for every frame of
+that episode. Otherwise falls back to the parent folder name (underscores → spaces)
+or the input directory basename.
 
 Output (example):
   cobot_dataset/
@@ -43,6 +49,49 @@ except Exception as e:  # pragma: no cover - import-time environment issue
 CAMERA_KEYS = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
 CHUNK_SIZE = 1000
 
+# Root-group HDF5 attributes tried in order for annotation.task (first non-empty wins).
+TASK_ATTR_KEYS = (
+    "task_description",
+    "language_instruction",
+    "instruction",
+    "task",
+    "task_name",
+)
+
+
+def _h5_attr_to_str(val) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        return s if s else None
+    if isinstance(val, (bytes, bytearray)):
+        s = bytes(val).decode("utf-8", errors="replace").strip()
+        return s if s else None
+    try:
+        if hasattr(val, "item"):
+            return _h5_attr_to_str(val.item())
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(val)
+        if arr.shape == ():
+            return _h5_attr_to_str(arr.item())
+    except Exception:
+        pass
+    s = str(val).strip()
+    return s if s else None
+
+
+def read_episode_instruction(h5f: h5py.File, fallback: str) -> str:
+    for key in TASK_ATTR_KEYS:
+        if key not in h5f.attrs:
+            continue
+        text = _h5_attr_to_str(h5f.attrs[key])
+        if text:
+            return text
+    return fallback
+
 
 def parse_episode_idx(path: Path) -> int:
     match = re.search(r"episode_(\d+)\.hdf5$", path.name)
@@ -51,11 +100,27 @@ def parse_episode_idx(path: Path) -> int:
     return int(match.group(1))
 
 
-def get_hdf5_paths(input_dir: Path) -> List[Path]:
-    paths = sorted(input_dir.glob("episode_*.hdf5"), key=parse_episode_idx)
-    if not paths:
-        raise FileNotFoundError(f"No episode_*.hdf5 files found in {input_dir}")
-    return paths
+def get_hdf5_paths(input_dir: Path, flat_only: bool) -> List[Path]:
+    flat = sorted(input_dir.glob("episode_*.hdf5"), key=parse_episode_idx)
+    if flat:
+        return flat
+    if flat_only:
+        raise FileNotFoundError(
+            f"No episode_*.hdf5 in {input_dir} (--flat-only: subdirectories not searched)."
+        )
+    deep = list(input_dir.rglob("episode_*.hdf5"))
+    if not deep:
+        raise FileNotFoundError(f"No episode_*.hdf5 under {input_dir}")
+    return sorted(deep, key=lambda p: (str(p.parent), parse_episode_idx(p)))
+
+
+def fallback_task_for_path(h5_path: Path, input_dir: Path) -> str:
+    """When HDF5 has no task attrs: use task folder name, else dataset root name."""
+    if h5_path.parent.resolve() != input_dir.resolve():
+        s = h5_path.parent.name.replace("_", " ").strip()
+        if s:
+            return s
+    return infer_task_text(input_dir, None)
 
 
 def ensure_output_layout(output_dir: Path) -> None:
@@ -120,7 +185,9 @@ def convert_episode(
     out_episode_idx: int,
     fps: float,
     task_text: str,
-) -> Tuple[int, int, int]:
+    use_h5_task_attrs: bool,
+    dataset_input_dir: Path,
+) -> Tuple[int, int, int, str]:
     chunk_idx = out_episode_idx // CHUNK_SIZE
     chunk_name = f"chunk-{chunk_idx:03d}"
     parquet_name = f"episode_{out_episode_idx:06d}.parquet"
@@ -142,7 +209,15 @@ def convert_episode(
         state_dim = int(qpos.shape[1])
         action_dim = int(action.shape[1])
 
-        df = build_episode_dataframe(qpos, action, out_episode_idx, fps, task_text)
+        if use_h5_task_attrs:
+            fb = fallback_task_for_path(h5_path, dataset_input_dir)
+            episode_task = read_episode_instruction(f, fb)
+        else:
+            episode_task = task_text
+
+        df = build_episode_dataframe(
+            qpos, action, out_episode_idx, fps, episode_task
+        )
         df.to_parquet(data_chunk_dir / parquet_name, index=False)
 
         for cam in CAMERA_KEYS:
@@ -154,7 +229,7 @@ def convert_episode(
             cam_dir.mkdir(parents=True, exist_ok=True)
             write_video_mp4(frames, cam_dir / video_name, fps=fps)
 
-    return timesteps, state_dim, action_dim
+    return timesteps, state_dim, action_dim, episode_task
 
 
 def build_info_json(
@@ -163,13 +238,14 @@ def build_info_json(
     fps: float,
     state_dim: int,
     action_dim: int,
+    total_tasks: int = 1,
 ) -> Dict:
     return {
         "codebase_version": "v2.0",
         "robot_type": "xdof",
         "total_episodes": total_episodes,
         "total_frames": total_frames,
-        "total_tasks": 1,
+        "total_tasks": int(total_tasks),
         "total_videos": total_episodes * len(CAMERA_KEYS),
         "chunks_size": CHUNK_SIZE,
         "fps": float(fps),
@@ -296,7 +372,24 @@ def main() -> None:
         "--task-text",
         type=str,
         default=None,
-        help="Optional override for annotation.task. Default: input-dir basename with '_' replaced by spaces",
+        help=(
+            "If set, this exact string is used as annotation.task for every episode "
+            "(ignores HDF5 task attributes)."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-h5-task-attrs",
+        action="store_true",
+        help=(
+            "Do not read task text from HDF5 root attributes; use the same fallback "
+            "string for all episodes (input-dir basename, underscores → spaces, "
+            "unless --task-text is set)."
+        ),
+    )
+    parser.add_argument(
+        "--flat-only",
+        action="store_true",
+        help="Only look for episode_*.hdf5 directly under --input-dir (no subdirectory search).",
     )
     parser.add_argument(
         "--force",
@@ -308,10 +401,11 @@ def main() -> None:
     input_dir = args.input_dir.resolve()
     output_dir = args.output_dir.resolve()
     task_text = infer_task_text(input_dir, args.task_text)
+    use_h5_task_attrs = args.task_text is None and not args.ignore_h5_task_attrs
     ensure_output_layout(output_dir)
     maybe_clear_old_outputs(output_dir, force=args.force)
 
-    h5_paths = get_hdf5_paths(input_dir)
+    h5_paths = get_hdf5_paths(input_dir, flat_only=args.flat_only)
     if args.max_episodes is not None:
         h5_paths = h5_paths[: args.max_episodes]
     if not h5_paths:
@@ -321,12 +415,24 @@ def main() -> None:
     total_frames = 0
     state_dim = None
     action_dim = None
+    distinct_tasks: set[str] = set()
 
     for out_ep_idx, h5_path in enumerate(h5_paths):
-        print(f"[{out_ep_idx + 1}/{len(h5_paths)}] converting {h5_path.name}")
-        t, sdim, adim = convert_episode(
-            h5_path, output_dir, out_ep_idx, args.fps, task_text
+        try:
+            rel = h5_path.relative_to(input_dir)
+        except ValueError:
+            rel = h5_path
+        print(f"[{out_ep_idx + 1}/{len(h5_paths)}] converting {rel}")
+        t, sdim, adim, ep_task = convert_episode(
+            h5_path,
+            output_dir,
+            out_ep_idx,
+            args.fps,
+            task_text,
+            use_h5_task_attrs=use_h5_task_attrs,
+            dataset_input_dir=input_dir,
         )
+        distinct_tasks.add(ep_task)
         total_frames += t
         if state_dim is None:
             state_dim = sdim
@@ -344,6 +450,7 @@ def main() -> None:
         fps=args.fps,
         state_dim=int(state_dim),
         action_dim=int(action_dim),
+        total_tasks=max(1, len(distinct_tasks)),
     )
     info_path = output_dir / "meta" / "info.json"
     with open(info_path, "w", encoding="utf-8") as f:
@@ -353,7 +460,13 @@ def main() -> None:
     print(f"- input_dir : {input_dir}")
     print(f"- output_dir: {output_dir}")
     print(f"- episodes  : {len(h5_paths)}")
-    print(f"- task_text : {task_text}")
+    if use_h5_task_attrs:
+        print(
+            f"- annotation.task: per-episode from HDF5 root attrs when present; "
+            f"{len(distinct_tasks)} distinct instruction(s)"
+        )
+    else:
+        print(f"- annotation.task (same for all episodes): {task_text}")
     print(f"- info.json : {info_path}")
     print("\nNext:")
     print(
