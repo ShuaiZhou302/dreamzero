@@ -224,58 +224,32 @@ class AlohaPolicy:
         converted["annotation.task"] = str(obs.get("prompt", ""))
         
         return converted
-    
+
     def _convert_action(self, action_dict: dict) -> np.ndarray:
-        """Convert AR_droid action dict to roboarena action array.
-        
-        AR_droid format:
-            - action.joint_position: (N, 7)
-            - action.gripper_position: (N,) or (N, 1)
-        
-        Roboarena format:
-            - action: (N, 8) - 7 joint positions + 1 gripper
-        """
-        joint_action = None
-        gripper_action = None
-        
-        # Extract actions from dict
-        for key, value in action_dict.items():
-            if "joint_position" in key:
-                joint_action = value
-            elif "gripper_position" in key or "gripper" in key:
-                gripper_action = value
-        
-        if joint_action is None:
-            # Fallback: return zeros
-            return np.zeros((1, 8), dtype=np.float32)
-        
-        # Convert to numpy if tensor
-        if isinstance(joint_action, torch.Tensor):
-            joint_action = joint_action.cpu().numpy()
-        
-        # Ensure 2D shape (N, 7)
-        if joint_action.ndim == 1:
-            joint_action = joint_action.reshape(1, -1)
-        
-        N = joint_action.shape[0]
-        
-        # Handle gripper action
-        if gripper_action is not None:
-            if isinstance(gripper_action, torch.Tensor):
-                gripper_action = gripper_action.cpu().numpy()
-            # Reshape to (N, 1) if needed
-            if gripper_action.ndim == 1:
-                gripper_action = gripper_action.reshape(-1, 1)
-            elif gripper_action.ndim == 0:
-                gripper_action = gripper_action.reshape(1, 1)
-        else:
-            gripper_action = np.zeros((N, 1), dtype=np.float32)
-        
-        # Concatenate: (N, 7) + (N, 1) -> (N, 8)
-        action = np.concatenate([joint_action, gripper_action], axis=-1).astype(np.float32)
-        
-        return action
-    
+        """agx_aloha: ``action.left_*`` / ``action.right_*`` -> ``(N, 14)`` (modality.json order)."""
+
+        def _to_2d(x, last_dim: int) -> np.ndarray:
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu().numpy()
+            a = np.asarray(x, dtype=np.float32)
+            while a.ndim > 2 and a.shape[0] == 1:
+                a = np.squeeze(a, axis=0)
+            if a.ndim == 1:
+                a = a.reshape(-1, last_dim) if last_dim and a.size % last_dim == 0 else a.reshape(1, -1)
+            return a
+
+        keys = (
+            "action.left_joint_pos",
+            "action.left_gripper_pos",
+            "action.right_joint_pos",
+            "action.right_gripper_pos",
+        )
+        dims = (6, 1, 6, 1)
+        if not action_dict or not all(k in action_dict for k in keys):
+            return np.zeros((1, 14), dtype=np.float32)
+        parts = [_to_2d(action_dict[k], d) for k, d in zip(keys, dims)]
+        return np.concatenate(parts, axis=-1).astype(np.float32)
+
     def _broadcast_batch_to_workers(self, obs: dict) -> None:
         """Broadcast batch data from rank 0 to all other ranks."""
         import pickle
@@ -299,7 +273,7 @@ class AlohaPolicy:
             obs: Observation dict in roboarena format
             
         Returns:
-            action: (N, 8) action array
+            action: ``(N, 14)`` float32 array (agx_aloha modality order).
         """
         # Check for session change - reset state if new session
         session_id = obs.get("session_id", None)
@@ -337,15 +311,23 @@ class AlohaPolicy:
         # Store video predictions for potential saving
         self.video_across_time.append(video_pred)
         
-        # Extract and convert action
-        action_chunk_dict = result_batch.act
-        
-        # Convert Batch to dict
-        action_dict = {}
-        for k in dir(action_chunk_dict):
-            if k.startswith("action."):
-                action_dict[k] = getattr(action_chunk_dict, k)
-        
+        act = result_batch.act
+        if isinstance(act, dict):
+            action_dict = {k: v for k, v in act.items() if isinstance(k, str) and k.startswith("action.")}
+        else:
+            action_dict = {}
+            try:
+                for k in act.keys():
+                    if isinstance(k, str) and k.startswith("action."):
+                        action_dict[k] = act[k]
+            except (AttributeError, TypeError):
+                pass
+            if not action_dict:
+                for k in dir(act):
+                    if isinstance(k, str) and k.startswith("action."):
+                        v = getattr(act, k, None)
+                        if v is not None and not callable(v):
+                            action_dict[k] = v
         action = self._convert_action(action_dict)
         
         # Update first call flag
