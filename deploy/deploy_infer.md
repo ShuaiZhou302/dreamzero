@@ -30,7 +30,7 @@
   - `[13]` → 右夹爪  
 - **语言**：obs 里带 **`prompt`**（`str`），server 侧映射为 **`annotation.task`**。
 - **会话**：**`session_id`**（任意可序列化、每局任务建议唯一），便于 server 清视频 buffer；新任务换新 id。
-- **时间维 T**（与 server `AlohaPolicy` 一致）：**该 `session_id` 下第一次 `infer`**，每路图 server 侧按 **最后 1 帧 → `T=1`**；**同 session 后续每次 `infer`** 按 **最后 4 帧 → `T=4`**。client 通常 **每控制周期发当前帧** 即可，历史帧由 server 端 buffer 累积；**不要**在未约定的情况下改变发送频率 unless 你也改 server。
+- **时间维 T**（按 `test_client_AR.py` 风格固定）：**该 `session_id` 下第一次 `infer`** 每路发送 **1 帧**（HWC）；**同 session 后续每次 `infer`** 每路发送 **4 帧**（THWC）。server 侧与此语义对齐（首步 `T=1`、后续 `T=4`）。
 
 **动作回包（目标形状）**：server 在 **`AlohaPolicy._convert_action` 按 agx 改完后** 应返回 **`numpy`，`shape == (N, 14)`**，`N` 与训练 **`action_horizon`** 一致（常见 **24**）。**14 维顺序与 `modality.json` 的 `action` 段相同**（与 `state` 分段一致：左 6+1，右 6+1）。若你当前仓库 server 仍返回 **`(N, 8)`**，客户端需暂时兼容或先完成 server Step 8 再联调。
 
@@ -147,21 +147,19 @@ def run_infer_loop(args, ros_operator):
 | Key | 类型 / 形状 | 说明 |
 |-----|-------------|------|
 | `session_id` | `str` 或 int | 同 Step 0；新任务换新值 |
-| `observation/cam_high` | `uint8` `(176,320,3)` | 或由映射表用 `exterior_image_0_left` 等 **与 server `image_key_mapping` 左侧一致** 的键名 |
-| `observation/cam_left_wrist` | 同上 | 第二路腕部或 exterior 槽位 1 |
-| `observation/cam_right_wrist` | 同上 | 第三路 |
+| `observation/exterior_image_0_left` | `uint8` `(176,320,3)` 或 `(4,176,320,3)` | 固定映射到训练语义 `cam_high` |
+| `observation/exterior_image_1_left` | 同上 | 固定映射到训练语义 `cam_left_wrist` |
+| `observation/wrist_image_left` | 同上 | 固定映射到训练语义 `cam_right_wrist` |
 | `observation/proprio` | `float`，`(14,)` 或 `(1,14)` | 与 `modality.json` 顺序一致；**推荐 `np.asarray(..., dtype=np.float64).reshape(-1)[:14]`** |
 | `prompt` | `str` | 使用 **`--task-name`** 或固定文案，例如 `f"Pick the apple: {args.task_name}"` |
 
-**语义映射示例（写在代码里的注释即可）：**
+**语义映射（固定采用 RoboArena 键名）：**
 
 ```text
-img_front  → observation/cam_high        （俯视 / high）
-img_left   → observation/cam_left_wrist
-img_right  → observation/cam_right_wrist
+img_front  → observation/exterior_image_0_left
+img_left   → observation/exterior_image_1_left
+img_right  → observation/wrist_image_left
 ```
-
-若你改用 RoboArena 键名，三行改为 `observation/exterior_image_0_left` 等，**但必须与 server Wrapper 映射及 Step 0 物理相机一致**。
 
 ### Step 6.1：协议参考来源（实现时对照）
 
@@ -171,26 +169,22 @@ img_right  → observation/cam_right_wrist
 
 ### Step 6.2：`test_client_AR.py` 里“首包 vs 后续包”怎么理解
 
-`test_client_AR.py` 是 **DROID-era 协议测试脚本**，有两点可借鉴但不能直接照抄：
+`test_client_AR.py` 是 **DROID-era 协议测试脚本**，交互骨架直接可用；我们按 agx_aloha 做三处确定改动：
 
 1. **首包与后续包图像时间维不同**  
    - 首包发送单帧（每路 `(H,W,3)`）；  
    - 后续发送多帧（示例是 4 帧 `(4,H,W,3)`）。  
    这和我们 server 侧 `AlohaPolicy` 的时间逻辑一致：新 session 首次 `infer` 用 `T=1`，后续使用 `T=4` 语义。
 
-2. **键名与动作维度是旧版 DROID 的**  
-   - 它用 `observation/exterior_image_*` / `wrist_image_left`、`joint_position/gripper_position`；  
-   - 并断言返回 `action.shape[-1] == 8`。  
-   对 agx_aloha 来说，这两点都要以我们当前约定覆盖：  
-   - 观测可用 `observation/cam_*`（或映射到 exterior/wrist 槽位，但语义必须对齐）；  
-   - `proprio` 按 14 维发送；  
-   - 目标动作为 `(N,14)`（与 `modality.json` 一致）。
+2. **键名沿用 RoboArena，状态/动作改成 agx**  
+   - 图像键固定用 `observation/exterior_image_*` / `observation/wrist_image_left`；  
+   - 状态改为 `observation/proprio`（14 维）；  
+   - 动作目标改为 `(N,14)`（与 `modality.json` 一致，替代旧的 8 维）。
 
 ### Step 6.3：发送节奏（基于交互骨架的落地规则）
 
 - 客户端每个控制周期都发送一次完整 `obs`（图像 + proprio + prompt + session_id）。
-- 首次可发送单帧 HWC，后续可继续单帧；server 侧会按自身缓存组织 `T=1/T=4` 语义。  
-  （也可以发送多帧 THWC，但第一版建议先保持“每步单帧”，简单且稳定。）
+- 发送策略固定：首次发送单帧 HWC；后续发送 4 帧 THWC（与 `test_client_AR.py` 一致）。
 
 ---
 
@@ -273,10 +267,10 @@ ssh -N -L 8766:127.0.0.1:8766 <user>@<cluster-login-or-node>
 
 > 注：若 server 实际跑在登录节点以外的计算节点，按你们集群策略改成跳板/二级转发即可；核心是把“真机本地端口”转到“server 所在机器端口”。
 
-### 8.5.3 启动前通信自检（最小）
+### 8.5.3 通信自检时机
 
-- 真机上先确认 TCP 通：`nc -vz <host> <port>`（或隧道后测 `127.0.0.1 8766`）。
-- 能连通后再启动 `run_infer_loop`，避免把 ROS 问题和网络问题混在一起。
+- 连通性检查放到 **最后联调阶段**（见文末附录 C）。
+- 本步骤先按代码逻辑实现，不要让网络细节打断 Step 5–9 开发。
 
 ---
 
@@ -400,6 +394,28 @@ PY
 ```
 
 若你们最终自写 client，可不依赖 `openpi_client.BasePolicy`，但仍要保证与 server 的 msgpack/WebSocket 协议一致。
+
+---
+
+## 附录 C：异机通信/SSH 隧道最终联调检查
+
+在 Step 9 代码完成后再做以下检查：
+
+1. **基础连通**
+   - 直连模式：`nc -vz <server_host> <server_port>`
+   - SSH 隧道模式：`nc -vz 127.0.0.1 8766`
+
+2. **登录节点转发（你们常见拓扑）**
+   - 真机执行：`ssh -N -L 8766:<compute_node>:8766 <user>@<login_node>`
+   - 客户端使用：`--server-host 127.0.0.1 --server-port 8766`
+
+3. **若 login 无法直连 compute 端口**
+   - 在 compute 侧反向隧道到 login，再由真机本地转发（见 Step 8.5.2）
+
+4. **联调顺序**
+   - 先跑 server 并确认监听端口
+   - 再起隧道
+   - 最后启动 `dz_aloha_infer.py`，观察 metadata 是否读取成功
 
 ---
 

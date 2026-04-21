@@ -8,6 +8,7 @@
 import numpy as np
 import argparse
 import cv2
+import uuid
 
 from collections import deque
 from eval_utils.policy_client import WebsocketClientPolicy
@@ -423,23 +424,125 @@ def run_infer_loops(args, ros_operator):
 
     
     rate = rospy.Rate(args.publish_rate)
-    while not rospy.is_shutdown():
-        result = ros_operator.get_frame()
-        if not result:
+    session_id = str(uuid.uuid4())
+    is_first_call = True
+    frame_buffers = {
+        "observation/exterior_image_0_left": deque(maxlen=4),
+        "observation/exterior_image_1_left": deque(maxlen=4),
+        "observation/wrist_image_left": deque(maxlen=4),
+    }
+
+
+    try:
+        while not rospy.is_shutdown():
+            result = ros_operator.get_frame()
+            if not result:
+                rate.sleep()
+                continue
+            (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
+             puppet_arm_left, puppet_arm_right, robot_base) = result
+            # step 5: preprocess the image
+            img_front = preprocess_image_for_server(img_front)
+            img_left = preprocess_image_for_server(img_left)
+            img_right = preprocess_image_for_server(img_right)
+            # step 6: form the observation
+            obs = build_observation(
+                img_front=img_front,
+                img_left=img_left,
+                img_right=img_right,
+                puppet_arm_left=puppet_arm_left,
+                puppet_arm_right=puppet_arm_right,
+                prompt=args.prompt,
+                session_id=session_id,
+                frame_buffers=frame_buffers,
+                is_first_call=is_first_call,
+            )
+
+            # step 7: prompt
+            # step 8: infer
+            try:
+                action = client.infer(obs)
+            except Exception as e:
+                rospy.logerr(f"DreamZero: error during inference: {e}")
+                rate.sleep()
+                continue
+
+            if not isinstance(action, np.ndarray):
+                rospy.logerr(f"unexpected action type: {type(action)}")
+                rate.sleep()
+                continue
+            
+            rospy.loginfo_throttle(2.0, f"action shape: {action.shape}")
+            # step 9: TODO: postprocess the action
+            # step 10: publish the action
+            if action.ndim != 2 or action.shape[1] != 14:
+                rospy.logerr(f"unexpected action shape: {action.shape}")
+                rate.sleep()
+                continue
+            
+            row = action[0].astype(np.float64)
+            left_cmd = np.zeros(7, dtype=np.float64)
+            right_cmd = np.zeros(7, dtype=np.float64)
+            left_cmd[:6] = row[0:6]
+            left_cmd[6] = row[6]
+            right_cmd[:6] = row[7:13]
+            right_cmd[6] = row[13]
+
+            if left_cmd.shape != (7,) or right_cmd.shape != (7,):
+                rospy.logerr(f"bad cmd shape: left={left_cmd.shape}, right={right_cmd.shape}")
+                rate.sleep()
+                continue
+
+            ros_operator.puppet_arm_publish(left_cmd.tolist(), right_cmd.tolist())
+
+            if is_first_call:
+                is_first_call = False
             rate.sleep()
-            continue
-        (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
-         puppet_arm_left, puppet_arm_right, robot_base) = result
-        # step 5: preprocess the image
-        img_front = preprocess_image_for_server(img_front)
-        img_left = preprocess_image_for_server(img_left)
-        img_right = preprocess_image_for_server(img_right)
-        # step 6: form the observation
-        # step 7: prompt
-        # step 8: infer
-        # step 9: postprocess the action
-        # step 10: publish the action
-        rate.sleep()
+    finally:
+        # test_client_AR.py behavior: send reset at end of run
+        try:
+            client.reset({})
+            rospy.loginfo("DreamZero: reset sent on exit")
+        except Exception as e:
+            rospy.logwarn(f"DreamZero: reset on exit failed: {e}")
+
+
+def build_observation(
+    img_front: np.ndarray,
+    img_left: np.ndarray,
+    img_right: np.ndarray,
+    puppet_arm_left,
+    puppet_arm_right,
+    prompt: str,
+    session_id: str,
+    frame_buffers: dict,
+    is_first_call: bool,
+) -> dict:
+    """Build obs using RoboArena keys: first call 1 frame, then 4-frame chunks."""
+    frame_buffers["observation/exterior_image_0_left"].append(img_front)
+    frame_buffers["observation/exterior_image_1_left"].append(img_left)
+    frame_buffers["observation/wrist_image_left"].append(img_right)
+
+    obs = {
+        "session_id": session_id,
+        "prompt": str(prompt),
+    }
+    for key, buf in frame_buffers.items():
+        if is_first_call:
+            obs[key] = buf[-1]
+        else:
+            frames = list(buf)
+            while len(frames) < 4:
+                frames.insert(0, frames[0])
+            obs[key] = np.stack(frames[-4:], axis=0)
+
+    left = np.asarray(puppet_arm_left.position, dtype=np.float64).reshape(-1)
+    right = np.asarray(puppet_arm_right.position, dtype=np.float64).reshape(-1)
+    proprio = np.concatenate([left[:7], right[:7]], axis=0)
+    if proprio.size < 14:
+        proprio = np.pad(proprio, (0, 14 - proprio.size))
+    obs["observation/proprio"] = proprio[:14]
+    return obs
 
 
 def preprocess_image_for_server(img: np.ndarray) -> np.ndarray:
