@@ -55,7 +55,7 @@ conda activate dz_shuai
 TRAIN_CONSOLE_LOG=1 AGX_ALOHA_DATA_ROOT=/data/user/wsong890/shuaizhou/dreamzero/cobot_data/cobot_dataset OUTPUT_DIR=./checkpoints/agx_aloha_h100_run1 NUM_GPUS=8 bash scripts/train/agx_aloha_training.sh
 
 
-# infer example for our model finetuning 
+# infer server example for our model finetuning 
 
 srun -p acd_u -c 8 --gres=gpu:2 --mem=256G --job-name=shuai_dz --pty bash
 
@@ -69,20 +69,9 @@ export HF_HUB_CACHE=$HF_HOME/hub
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-python - <<'PY'
-import pathlib, re
-p = pathlib.Path("/data/user/wsong890/shuaizhou/dreamzero/checkpoints/DreamZero-DROID/experiment_cfg/conf.yaml")
-s = p.read_text()
-s = re.sub(
-    r"tokenizer_path:\s*.*",
-    "tokenizer_path: /data/user/wsong890/shuaizhou/dreamzero/checkpoints/umt5-xxl",
-    s,
-)
-p.write_text(s)
-PY
 
 CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 \
   socket_test_optimized_AR_aloha.py \
-  --model-path checkpoints/agx_aloha_h100_run1/checkpoint-30000 \
+  --model-path checkpoints/agx_aloha_h100_run1/checkpoint-50000 \
   --port 8766 \
   --enable-dit-cache
