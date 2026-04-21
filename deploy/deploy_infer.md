@@ -1,6 +1,8 @@
 # DreamZero 真机推理客户端：`dz_aloha_infer.py` 改造说明
 
-本文约定：**不讨论** conda / ROS 包 / `cv_bridge` 等依赖是否安装，默认环境已就绪。目标是把当前以 **ACT 本地推理** 为主的 `deploy/dz_aloha_infer.py`，改成 **ROS 收真机观测 → WebSocket 调 DreamZero server → 收 action → 再 publish 给机器人** 的闭环；行为上对齐「原版 `demo_inference.py` 的 RosOperator + 控制循环」，模型侧与 **`socket_test_optimized_AR_aloha.py` + `AlohaPolicy`** 及 **`cobot_data/cobot_dataset/meta/modality.json`** 一致。
+本文约定：**不讨论** conda / ROS 包 / `cv_bridge` 等依赖是否安装，默认环境已就绪。目标是把 `deploy/dz_aloha_infer.py` 改成 **ROS 收真机观测 → WebSocket 调 DreamZero server → 收 action → 再 publish 给机器人** 的闭环；模型侧与 **`socket_test_optimized_AR_aloha.py` + `AlohaPolicy`** 及 **`cobot_data/cobot_dataset/meta/modality.json`** 一致。
+
+**ROS 侧「怎么订阅 / 同步帧 / 往真机发关节」不要凭记忆猜接口**：以仓库里的 **`deploy/other_vla_demo_deploy/demo_inference.py`** 为准（`RosOperator`、`get_frame()`、`puppet_arm_publish` / `puppet_arm_publish_continuous`、`JointState` topic 等）。当前 `dz_aloha_infer.py` 里为瘦身已去掉 **本地 ACT 推理** 大段代码；**实现 DreamZero infer 循环时**，把「原 demo 里接在 `policy(...)` 后面的 publish 逻辑」接到 **`client.infer(obs)` 返回的 `(N,14)`** 上即可，**ROS 发布接口仍与 demo 对齐**（仅把动作来源从本地模型换成 server 回包，维数按 agx 14 与 `modality.json` 拆左右臂）。
 
 ---
 
@@ -90,6 +92,41 @@
 
 ---
 
+## Step 4.5：先搭 `run_infer_loop` 骨架（后续 Step 5–9 都填在这里）
+
+先不要追求一次写完，先在 `dz_aloha_infer.py` 建一个最小主循环函数，例如：
+
+```text
+def run_infer_loop(args, ros_operator):
+  client = ...  # WebSocket client
+  rate = rospy.Rate(args.publish_rate)
+  while not rospy.is_shutdown():
+    result = ros_operator.get_frame()
+    if not result: continue
+    # Step 5: 图像预处理
+    # Step 6: 组 obs
+    # Step 7: prompt
+    # Step 8: client.infer(obs)
+    # Step 9: action -> publish
+```
+
+`main()` 里改成：`args -> RosOperator(args) -> run_infer_loop(args, ros_operator)`。  
+后面步骤主要就是往这个函数里补内容，不要分散到多个旧 ACT 函数里。
+
+---
+
+## Step 4.6：握手后先做 metadata 校验（避免静默错配）
+
+拿到 `client.get_server_metadata()` 后，建议在进入主循环前校验这些关键项：
+
+- `image_resolution`（与本地 resize 目标一致，默认应对应 176×320）
+- `n_external_cameras`、`needs_wrist_camera`（与三路图发送方案一致）
+- `needs_session_id`（若为 true，确保你每次 `obs` 带 `session_id`）
+
+若关键字段不一致，直接日志报错并退出，不要“先跑再看”。
+
+---
+
 ## Step 5：图像 → server 线协议格式
 
 在 **`get_frame()` 成功返回之后**、调用 **`client.infer(obs)` 之前**，对每路 `uint8` BGR/RGB（按你相机实际）：
@@ -105,7 +142,7 @@
 
 ## Step 6：组装发给 server 的 `obs` 字典
 
-每一控制周期构造 **Python `dict`**（`WebsocketClientPolicy.infer` 会在内部加 **`endpoint: "infer"`**，你无需手写；若自写 WebSocket，必须加）。
+每一控制周期构造 **Python `dict`**。若用 `WebsocketClientPolicy`，`infer()` 会自动加 **`endpoint: "infer"`**；若你自写 client，必须手动加该字段并保持与 server 协议一致。
 
 | Key | 类型 / 形状 | 说明 |
 |-----|-------------|------|
@@ -125,6 +162,35 @@ img_right  → observation/cam_right_wrist
 ```
 
 若你改用 RoboArena 键名，三行改为 `observation/exterior_image_0_left` 等，**但必须与 server Wrapper 映射及 Step 0 物理相机一致**。
+
+### Step 6.1：协议参考来源（实现时对照）
+
+- **真机 ROS 收发接口怎么写**：以 `deploy/other_vla_demo_deploy/demo_inference.py` 为准（`RosOperator` / `get_frame` / `puppet_arm_publish`）。
+- **client 与 server 交互协议怎么写**：优先对照 `eval_utils/policy_client.py`；如果自写 client，再参考 `test_client_AR.py` 的 send/recv 节奏与字段组织。
+- **server 当前真实期望**：以 `socket_test_optimized_AR_aloha.py` 的 `AlohaPolicy._convert_observation` / `image_key_mapping` / `_convert_action` 为最终准绳。
+
+### Step 6.2：`test_client_AR.py` 里“首包 vs 后续包”怎么理解
+
+`test_client_AR.py` 是 **DROID-era 协议测试脚本**，有两点可借鉴但不能直接照抄：
+
+1. **首包与后续包图像时间维不同**  
+   - 首包发送单帧（每路 `(H,W,3)`）；  
+   - 后续发送多帧（示例是 4 帧 `(4,H,W,3)`）。  
+   这和我们 server 侧 `AlohaPolicy` 的时间逻辑一致：新 session 首次 `infer` 用 `T=1`，后续使用 `T=4` 语义。
+
+2. **键名与动作维度是旧版 DROID 的**  
+   - 它用 `observation/exterior_image_*` / `wrist_image_left`、`joint_position/gripper_position`；  
+   - 并断言返回 `action.shape[-1] == 8`。  
+   对 agx_aloha 来说，这两点都要以我们当前约定覆盖：  
+   - 观测可用 `observation/cam_*`（或映射到 exterior/wrist 槽位，但语义必须对齐）；  
+   - `proprio` 按 14 维发送；  
+   - 目标动作为 `(N,14)`（与 `modality.json` 一致）。
+
+### Step 6.3：发送节奏（基于交互骨架的落地规则）
+
+- 客户端每个控制周期都发送一次完整 `obs`（图像 + proprio + prompt + session_id）。
+- 首次可发送单帧 HWC，后续可继续单帧；server 侧会按自身缓存组织 `T=1/T=4` 语义。  
+  （也可以发送多帧 THWC，但第一版建议先保持“每步单帧”，简单且稳定。）
 
 ---
 
@@ -148,10 +214,13 @@ img_right  → observation/cam_right_wrist
 **启动阶段（`main` 或 `run_infer` 入口）：**
 
 1. **`rospy.init_node(...)`**，构造 **`RosOperator(args)`**。
-2. **`client = WebsocketClientPolicy(host=args.server_host, port=args.server_port)`**  
-   - 首包会收到 **`PolicyServerConfig`**（`client.get_server_metadata()`），可用于日志或校验 client 本地 resize 与 `image_resolution` 一致。
+2. **创建 client（二选一）**：  
+   - 现成封装：`client = WebsocketClientPolicy(host=args.server_host, port=args.server_port)`；  
+   - 自写轻量 client：按 **`eval_utils/policy_client.py`** 的协议发收（msgpack、`endpoint`、错误处理）。  
+   - 不论哪种方式，首包都应读取 server metadata（`PolicyServerConfig`）用于核对分辨率与字段约定。
 3. **（推荐）** 每局任务开始前调用 **`client.reset({...})`**：  
-   - `reset_info` 里可带 **`session_id`**（若 server 的 `BasePolicy.reset` 会用到）；**`WebsocketClientPolicy.reset` 已设置 `endpoint: "reset"`**。  
+   - `reset_info` 里可带 **`session_id`**（若 server 的 `BasePolicy.reset` 会用到）。  
+   - 使用 `WebsocketClientPolicy` 时，`reset()` 已自动设置 `endpoint: "reset"`；自写 client 需手动加。  
    - 与 **`AlohaPolicy.reset`** 联动清 buffer（若你 Wrapper 在 reset 里清帧缓存）。
 
 **控制循环内：**
@@ -164,7 +233,50 @@ img_right  → observation/cam_right_wrist
    - 调用 **Step 9** 把 `action` 发到机器人。  
    - **`rate.sleep()`**。
 
-**`session_id`：** 整段 demo **固定一个**；用户按「新任务」重启节点或传参换新 **`session_id`** 即可触发 server 端 `_reset_state`。
+**`session_id` / `reset` 规则（建议写死在代码里）：**
+
+- 新任务开始：生成新 `session_id`；  
+- 进入主循环前：调用一次 `client.reset({"session_id": session_id})`（或最少 `client.reset({})`）；  
+- 主循环内：每条 `obs` 都带同一个 `session_id`；  
+- 任务结束：再 `client.reset({})` 一次做收尾（便于 server 清缓存/落盘）。
+
+---
+
+## Step 8.5：异机部署（真机 client + 集群 server）通信方式
+
+本项目支持 **client 与 server 不同机器**（这是推荐部署方式）：
+
+- **server**：在集群机器上运行 `socket_test_optimized_AR_aloha.py`（加载 checkpoint、执行模型）。
+- **client/infer**：在真机本地运行 `dz_aloha_infer.py`（采集 ROS、发请求、收 action、publish）。
+
+两边只通过 WebSocket 协议通信，不要求共享 Python 环境。
+
+### 8.5.1 直连模式（优先）
+
+- 真机可直接访问集群节点网络时：  
+  `--server-host <集群IP或DNS> --server-port 8766`
+- 集群侧需允许该端口入站（防火墙/安全组/节点监听地址）。
+
+### 8.5.2 SSH 隧道模式（常见于集群仅内网可达）
+
+若集群节点不能被真机直接访问，可在真机建立端口转发：
+
+```bash
+ssh -N -L 8766:127.0.0.1:8766 <user>@<cluster-login-or-node>
+```
+
+然后客户端仍用本地地址：
+
+```text
+--server-host 127.0.0.1 --server-port 8766
+```
+
+> 注：若 server 实际跑在登录节点以外的计算节点，按你们集群策略改成跳板/二级转发即可；核心是把“真机本地端口”转到“server 所在机器端口”。
+
+### 8.5.3 启动前通信自检（最小）
+
+- 真机上先确认 TCP 通：`nc -vz <host> <port>`（或隧道后测 `127.0.0.1 8766`）。
+- 能连通后再启动 `run_infer_loop`，避免把 ROS 问题和网络问题混在一起。
 
 ---
 
@@ -195,6 +307,12 @@ ros_operator.puppet_arm_publish(left.tolist(), right.tolist())
 **多步 chunk（`N>1`）**：可与原 ACT 类似——每控制周期推进 `t`，使用 **`action[t % N]`** 或只执行前 **`K` 步再请求下一次 `infer`**；需与 **`publish_rate`**、机器人跟踪能力一起调，**本文不强制一种策略**，但必须在代码里 **写死一种** 并加注释。
 
 若 server 仍返回 **`dict`**（`action.left_joint_pos` 等），先在客户端 **拼成 `(N,14)`** 再走上表。
+
+### Step 9.1：通信异常与重连（建议第一版就加）
+
+- `client.infer(obs)` 抛异常时：日志打印错误并跳过当步，不要直接崩溃。  
+- 连接断开时：重建 client -> 重新 metadata 校验 -> 重新 `reset/session_id` -> 继续循环。  
+- publish 前做轻量断言：`isinstance(action, np.ndarray)` 且 `action.ndim == 2`，目标最后维 `14`。
 
 ---
 
@@ -249,6 +367,39 @@ parse_args()
 | `socket_test_optimized_AR_aloha.py` | `AlohaPolicy` 观测转换与（待 Step 8）动作回包形状 |
 | `deploy/deploy_server.md` | server / Wrapper 侧步骤与键名约定 |
 | `cobot_data/cobot_dataset/meta/modality.json` | **14 维 state/action 顺序真值** |
+
+---
+
+## 附录 B：`WebsocketClientPolicy` 依赖清单（真机环境）
+
+`eval_utils/policy_client.py` 直接依赖：
+
+- `websockets`（使用 `websockets.sync.client`）
+- `typing_extensions`
+- `openpi_client`（其中提供 `base_policy` 与 `msgpack_numpy`）
+
+其中 `openpi_client.msgpack_numpy` 会间接需要 msgpack/numpy 相关能力。  
+建议在真机环境先做一次导入自检（只要能过，后续再接 ROS）：
+
+```bash
+python - <<'PY'
+mods = [
+  'websockets',
+  'typing_extensions',
+  'openpi_client',
+  'openpi_client.msgpack_numpy',
+  'openpi_client.base_policy',
+]
+for m in mods:
+  try:
+    __import__(m)
+    print('OK ', m)
+  except Exception as e:
+    print('ERR', m, e)
+PY
+```
+
+若你们最终自写 client，可不依赖 `openpi_client.BasePolicy`，但仍要保证与 server 的 msgpack/WebSocket 协议一致。
 
 ---
 
