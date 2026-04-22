@@ -830,7 +830,7 @@ def main(args: Args) -> None:
     
     # Configure server for aloha (1 cameras, 2 wrist camera, joint position actions)
     server_config = PolicyServerConfig(
-        image_resolution=(176, 320),  # 
+        image_resolution=(480, 640),  # 
         needs_wrist_camera=True, # so we have the right wrist camera
         n_external_cameras=2, # we only have 1 external camera what is high camera
         needs_stereo_camera=False,

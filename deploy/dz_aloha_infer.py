@@ -38,6 +38,7 @@ sys.path.append("./")
 
 class RosOperator:
     def __init__(self, args):
+        print("[DZ] RosOperator init start.")
         self.robot_base_deque = None
         self.puppet_arm_right_deque = None
         self.puppet_arm_left_deque = None
@@ -57,7 +58,9 @@ class RosOperator:
         self.ctrl_state = False
         self.ctrl_state_lock = threading.Lock()
         self.init()
+        print("[DZ] RosOperator buffer init done, calling init_ros()...")
         self.init_ros()
+        print("[DZ] RosOperator init_ros done.")
 
     def init(self):
         self.bridge = CvBridge()
@@ -319,7 +322,9 @@ class RosOperator:
         return state
 
     def init_ros(self):
+        print("[DZ] init_ros: calling rospy.init_node...")
         rospy.init_node('joint_state_publisher', anonymous=True)
+        print("[DZ] init_ros: rospy.init_node done, registering topics...")
         rospy.Subscriber(self.args.img_left_topic, Image, self.img_left_callback, queue_size=1000, tcp_nodelay=True)
         rospy.Subscriber(self.args.img_right_topic, Image, self.img_right_callback, queue_size=1000, tcp_nodelay=True)
         rospy.Subscriber(self.args.img_front_topic, Image, self.img_front_callback, queue_size=1000, tcp_nodelay=True)
@@ -333,6 +338,7 @@ class RosOperator:
         self.puppet_arm_left_publisher = rospy.Publisher(self.args.puppet_arm_left_cmd_topic, JointState, queue_size=10)
         self.puppet_arm_right_publisher = rospy.Publisher(self.args.puppet_arm_right_cmd_topic, JointState, queue_size=10)
         self.robot_base_publisher = rospy.Publisher(self.args.robot_base_cmd_topic, Twist, queue_size=10)
+        print("[DZ] init_ros: topic registration done.")
 
 
 def get_arguments():
@@ -421,8 +427,8 @@ def run_infer_loops(args, ros_operator):
         raise RuntimeError(f"server config mismatch: n_external_cameras={metadata.get('n_external_cameras')} (expect 2)")
     if metadata.get("needs_session_id") is not True:
         raise RuntimeError("server config mismatch: needs_session_id should be True")
-    if tuple(metadata.get("image_resolution")) != (176, 320):
-        raise RuntimeError(f"server config mismatch: image_resolution={metadata.get('image_resolution')} (expect (176, 320))")
+    if tuple(metadata.get("image_resolution")) != (480, 640):
+        raise RuntimeError(f"server config mismatch: image_resolution={metadata.get('image_resolution')} (expect (480, 640))")
 
     
     rate = rospy.Rate(args.publish_rate)
@@ -450,10 +456,10 @@ def run_infer_loops(args, ros_operator):
                 empty_frame_count = 0
             (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
              puppet_arm_left, puppet_arm_right, robot_base) = result
-            # step 5: preprocess the image
-            img_front = preprocess_image_for_server(img_front)
-            img_left = preprocess_image_for_server(img_left)
-            img_right = preprocess_image_for_server(img_right)
+            # step 5: preprocess the image  seens like we dont need to preprocess and resize it?
+            # img_front = preprocess_image_for_server(img_front)
+            # img_left = preprocess_image_for_server(img_left)
+            # img_right = preprocess_image_for_server(img_right)
             # step 6: form the observation
             obs = build_observation(
                 img_front=img_front,

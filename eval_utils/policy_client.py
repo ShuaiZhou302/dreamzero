@@ -39,28 +39,31 @@ class WebsocketClientPolicy(BasePolicy):
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
         try:
-            conn = websockets.sync.client.connect(
-                self._uri, 
-                compression=None, 
+            conn = self._connect_with_ping_fallback(self._uri)
+            metadata = msgpack_numpy.unpackb(conn.recv())
+            return conn, metadata
+        except Exception as e:
+            # For local deployment we expect plain ws://. Auto-upgrading to wss:// can
+            # mask the root cause and lead to TLS handshake timeouts on non-TLS ports.
+            logging.error(f"Connection to server at {self._uri} failed: {e}")
+            raise
+
+    def _connect_with_ping_fallback(self, uri: str) -> websockets.sync.client.ClientConnection:
+        try:
+            return websockets.sync.client.connect(
+                uri,
+                compression=None,
                 max_size=None,
                 ping_interval=PING_INTERVAL_SECS,
                 ping_timeout=PING_TIMEOUT_SECS,
             )
-            metadata = msgpack_numpy.unpackb(conn.recv())
-            return conn, metadata
-        except:
-            logging.info("Connection to server with ws:// failed. Trying wss:// ...")
-            
-        self._uri = "wss://" + self._uri.split("//")[1]
-        conn = websockets.sync.client.connect(
-            self._uri, 
-            compression=None, 
-            max_size=None,
-            ping_interval=PING_INTERVAL_SECS,
-            ping_timeout=PING_TIMEOUT_SECS,
-        )
-        metadata = msgpack_numpy.unpackb(conn.recv())
-        return conn, metadata
+        except TypeError:
+            logging.warning("websockets.connect doesn't support ping_* args, retrying without them.")
+            return websockets.sync.client.connect(
+                uri,
+                compression=None,
+                max_size=None,
+            )
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
