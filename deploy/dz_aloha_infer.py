@@ -406,11 +406,13 @@ def get_arguments():
 
 
 def run_infer_loops(args, ros_operator):
+    print(f"[DZ] connecting to server ws://{args.server_host}:{args.server_port}")
     client = WebsocketClientPolicy(
         host=args.server_host,
         port=args.server_port
     )
     metadata = client.get_server_metadata()
+    print(f"[DZ] server metadata received: {metadata}")
     rospy.loginfo(f"DreamZero: server metadata: {metadata}")
     
     if metadata.get("needs_wrist_camera") is not True:
@@ -433,12 +435,19 @@ def run_infer_loops(args, ros_operator):
     }
 
 
+    empty_frame_count = 0
     try:
         while not rospy.is_shutdown():
             result = ros_operator.get_frame()
             if not result:
+                empty_frame_count += 1
+                if empty_frame_count % (args.publish_rate * 2) == 0:
+                    print("[DZ] waiting for synchronized ROS frames/topics...")
                 rate.sleep()
                 continue
+            if empty_frame_count:
+                print("[DZ] ROS frames ready, entering inference loop.")
+                empty_frame_count = 0
             (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
              puppet_arm_left, puppet_arm_right, robot_base) = result
             # step 5: preprocess the image
@@ -472,6 +481,7 @@ def run_infer_loops(args, ros_operator):
                 rate.sleep()
                 continue
             
+            print(f"[DZ] action received with shape: {action.shape}")
             rospy.loginfo_throttle(2.0, f"action shape: {action.shape}")
             # step 9: TODO: postprocess the action
             # step 10: publish the action
@@ -559,8 +569,11 @@ def preprocess_image_for_server(img: np.ndarray) -> np.ndarray:
 
 
 def main():
+    print("[DZ] dz_aloha_infer starting...")
     args = get_arguments()
+    print(f"[DZ] args: host={args.server_host}, port={args.server_port}, publish_rate={args.publish_rate}")
     ros_operator = RosOperator(args)
+    print("[DZ] ROS operator initialized.")
     run_infer_loops(args, ros_operator)
 
 

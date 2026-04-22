@@ -1,3 +1,4 @@
+cd /data/user/wsong890/shuaizhou/dreamzero
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH
 
 export HF_HOME=/data/user/wsong890/shuaizhou/dreamzero/checkpoints/hf_cache
