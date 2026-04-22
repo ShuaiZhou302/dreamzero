@@ -1,0 +1,15 @@
+# Minimal pip dependencies for cobot / edge machine:
+# - test_client_AR.py
+# - deploy/dz_aloha_infer.py (Python-side only; ROS 见 deploy/Readme.md)
+# - eval_utils/policy_client.py + policy_server.py (仅 PolicyServerConfig)
+#
+# Python: 3.11.x（与仓库 pyproject 一致，勿用 3.13+）
+# 与根目录 README 完整训练/推理栈无关；不含 torch、transformers 等。
+
+numpy==1.26.4
+websockets>=12.0,<16
+typing_extensions>=4.8.0
+msgpack>=1.0.0
+msgpack-numpy>=0.4.8
+openpi-client==0.1.1
+opencv-python==4.8.0.74

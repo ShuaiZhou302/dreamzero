@@ -397,25 +397,124 @@ PY
 
 ---
 
-## 附录 C：异机通信/SSH 隧道最终联调检查
+## 附录 C：异机通信/SSH 隧道最终联调检查（分步）
 
-在 Step 9 代码完成后再做以下检查：
+在 Step 9 代码完成后再做；**建议先只做本附录，再跑 `dz_aloha_infer.py` 全链路**。默认 server 端口 **`8766`**。
 
-1. **基础连通**
-   - 直连模式：`nc -vz <server_host> <server_port>`
-   - SSH 隧道模式：`nc -vz 127.0.0.1 8766`
+### 0. 先记下三个角色（填你自己的值）
 
-2. **登录节点转发（你们常见拓扑）**
-   - 真机执行：`ssh -N -L 8766:<compute_node>:8766 <user>@<login_node>`
-   - 客户端使用：`--server-host 127.0.0.1 --server-port 8766`
+| 角色 | 含义 | 示例（按你们环境替换） |
+|------|------|------------------------|
+| **计算结点** | `srun` 后跑 `socket_test_optimized_AR_aloha.py` 的那台 | 提示符里如 `ACD1-29` |
+| **登录/管理机** | 真机 `ssh` 先进去的那台 | 如 `10.120.48.26`（或 SSH config 里的 `Host` 别名） |
+| **真机** | 跑 ROS 客户端或本附录里 `nc`/探活脚本的机器 | 如 `agilex` |
 
-3. **若 login 无法直连 compute 端口**
-   - 在 compute 侧反向隧道到 login，再由真机本地转发（见 Step 8.5.2）
+在**计算结点**上确认 hostname / 内网 IP（隧道里 `-L` 的目标有时要用 IP）：
 
-4. **联调顺序**
-   - 先跑 server 并确认监听端口
-   - 再起隧道
-   - 最后启动 `dz_aloha_infer.py`，观察 metadata 是否读取成功
+```bash
+hostname
+hostname -I
+```
+
+---
+
+### 1. 在计算结点上：启动 server 并确认已监听
+
+1. 进入仓库、激活环境，按 `general_command.txt` 或你们既定命令启动 server（**保持该终端不关、不按 Ctrl+C**）。
+2. 日志里应出现类似：`server listening on 0.0.0.0:8766`。
+3. **另开一个 SSH 到同一计算结点的终端**，执行：
+
+```bash
+ss -ltnp | awk 'NR==1 || /:8766/'
+```
+
+能看到 `0.0.0.0:8766`（或等价监听）再继续下一步。**若此处没有监听，真机侧怎么测都是 `Connection refused`。**
+
+---
+
+### 2. 选拓扑：真机能否直连计算结点 `:8766`
+
+在**真机**上试（把 `<compute>` 换成 hostname 或 `hostname -I` 里与真机互通的 IP）：
+
+```bash
+nc -vz <compute> 8766
+```
+
+- **成功（open / succeeded）**：可走**直连**，client 用 `--server-host <compute> --server-port 8766`。
+- **超时 / refused**：多数集群不允许真机直连计算结点端口，走**下面第 3 步 SSH 隧道**。
+
+---
+
+### 3. 隧道拓扑：真机 → 登录机 → 计算结点 `:8766`
+
+在**真机**上建立本地转发（**占用真机本机 8766**，与 server 端口数字一致即可）：
+
+```bash
+ssh -N -L 8766:<compute>:8766 <user>@<login>
+```
+
+示例（仅作格式参考，请替换为你的计算结点名与账号）：
+
+```bash
+ssh -N -L 8766:ACD1-29:8766 haoangli@10.120.48.26
+```
+
+- **`<login>`**：必须与你平时能 `ssh` 登录集群的写法一致（IP、`Host` 别名均可）。
+- **`<compute>`**：填计算结点 **hostname**；若登录机解析不到或转发失败，可改为该计算结点的**内网 IP**（与在计算结点上 `hostname -I` 对照）。
+- **认证**：若出现 `Permission denied`，说明卡在 **「真机 → 登录机」SSH 认证**，尚未连到计算结点。处理要点：
+  - 与「不带 `-N -L`、能成功登录」的那条命令使用**同一用户、同一密钥**；若平时用密钥，需加 `-i /path/to/key`，或在 `~/.ssh/config` 里为 `<login>` 配好 `IdentityFile` 后用 `Host` 别名执行隧道。
+  - 可用 `ssh -v <user>@<login>` 看最终走的是 `publickey` 还是 `password`（集群若仅允许公钥，则不能只靠密码）。
+- 该 `ssh -N -L ...` 终端会**一直挂起**，属正常；**另开新终端**做第 4、5 步。
+
+**若登录机无法 TCP 连到计算结点 `8766`**（防火墙/路由策略）：需在集群内按 Step 8.5.2 改用**反向隧道**或其它运维允许的通路；本附录不展开。
+
+---
+
+### 4. 在真机上：端口连通（隧道模式用本机回环）
+
+- **已建隧道**（第 3 步）时：
+
+```bash
+nc -vz 127.0.0.1 8766
+```
+
+- **直连模式**（第 2 步 `nc` 已成功）时，可再测一次：
+
+```bash
+nc -vz <compute> 8766
+```
+
+`Connection refused`：server 未起、端口不对、或隧道目标 `<compute>` 写错。  
+`Permission denied`：**不是**端口问题，见第 3 步 SSH 说明。
+
+---
+
+### 5. 在真机上：协议层探活（metadata，仍不跑 infer）
+
+在 **dreamzero 仓库根**（或设置好 `PYTHONPATH` 指向仓库根）下执行；**隧道模式**下 `host` 用 `127.0.0.1`，**直连模式**下用 `<compute>`。
+
+```bash
+cd /path/to/dreamzero
+python - <<'PY'
+from eval_utils.policy_client import WebsocketClientPolicy
+host = "127.0.0.1"  # 隧道模式；直连则改为计算结点 IP/hostname
+port = 8766
+c = WebsocketClientPolicy(host=host, port=port)
+print(c.get_server_metadata())
+PY
+```
+
+能打印出字典（含 `image_resolution`、`n_external_cameras`、`needs_wrist_camera` 等）即 **WebSocket + 首包 metadata 正常**。再进入 Step 4.6 与 `dz_aloha_infer.py` 全链路。
+
+---
+
+### 6. 推荐联调顺序（小结）
+
+1. 计算结点：起 server → `ss` 确认 `8766` 监听。  
+2. 真机：`nc` 判直连或隧道。  
+3. 隧道：真机 `ssh -N -L ...`（认证与日常登录一致）→ `nc -vz 127.0.0.1 8766`。  
+4. 真机：`get_server_metadata()` 探活。  
+5. 最后：`dz_aloha_infer.py`（`--server-host` / `--server-port` 与上面选择一致）。
 
 ---
 
